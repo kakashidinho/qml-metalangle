@@ -1,23 +1,12 @@
-#include <metal_stdlib>
-#include <simd/simd.h>
+attribute vec4 Position;
+attribute vec4 SourceColor;
 
-using namespace metal;
+varying vec4 DestinationColor;
 
-struct main0_out
-{
-    float2 coords [[user(locn0)]];
-    float4 gl_Position [[position]];
-};
+uniform mat4 Projection;
+uniform mat4 Modelview;
 
-struct main0_in
-{
-    float4 vertices [[attribute(0)]];
-};
-
-vertex main0_out main0(main0_in in [[stage_in]])
-{
-    main0_out out = {};
-    out.gl_Position = in.vertices;
-    out.coords = in.vertices.xy;
-    return out;
+void main(void) {
+    DestinationColor = SourceColor;
+    gl_Position = Projection * Modelview * Position;
 }

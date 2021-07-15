@@ -118,6 +118,6 @@ Rectangle {
         anchors.right: renderer.right
         anchors.margins: 20
         wrapMode: Text.WordWrap
-        text: "The squircle, using rendering code borrowed from the metalunderqml example, is rendered into a texture directly with Metal. The MTLTexture is then imported and used in a custom Qt Quick item."
+        text: "The squircle, using rendering code borrowed from the metalunderqml example, is rendered into a texture directly with MetalANGLE's GL commands. The MTLTexture is then imported and used in a custom Qt Quick item."
     }
 }

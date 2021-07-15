@@ -47,6 +47,7 @@
 ** $QT_END_LICENSE$
 **
 ****************************************************************************/
+#define GL_SILENCE_DEPRECATION // annoying OpenGL warnings from Apple's headers
 
 #include "metaltextureimport.h"
 #include <QtGui/QScreen>
@@ -55,7 +56,76 @@
 #include <QtQuick/QSGSimpleTextureNode>
 #include <QtCore/QFile>
 
+#include <MetalANGLE/MGLKit.h>
+#include <MetalANGLE/EGL/egl.h>
+#define EGL_EGLEXT_PROTOTYPES
+#include <MetalANGLE/EGL/eglext.h>
+#include <MetalANGLE/GLES2/gl2.h>
+#include <MetalANGLE/GLES2/gl2ext.h>
+
 #include <Metal/Metal.h>
+
+extern "C"
+{
+// Third party maths library
+#include "../maths/CC3GLMatrix.h"
+}
+
+namespace
+{
+
+struct Vertex
+{
+    float Position[3];
+    float Color[4];
+};
+
+const Vertex kVertices[] = {
+    // Front
+    {{1, -1, 0}, {1, 0, 0, 1}},
+    {{1, 1, 0}, {0, 1, 0, 1}},
+    {{-1, 1, 0}, {0, 0, 1, 1}},
+    {{-1, -1, 0}, {0, 0, 0, 1}},
+    // Back
+    {{1, 1, -2}, {1, 0, 0, 1}},
+    {{-1, -1, -2}, {0, 1, 0, 1}},
+    {{1, -1, -2}, {0, 0, 1, 1}},
+    {{-1, 1, -2}, {0, 0, 0, 1}},
+    // Left
+    {{-1, -1, 0}, {1, 0, 0, 1}},
+    {{-1, 1, 0}, {0, 1, 0, 1}},
+    {{-1, 1, -2}, {0, 0, 1, 1}},
+    {{-1, -1, -2}, {0, 0, 0, 1}},
+    // Right
+    {{1, -1, -2}, {1, 0, 0, 1}},
+    {{1, 1, -2}, {0, 1, 0, 1}},
+    {{1, 1, 0}, {0, 0, 1, 1}},
+    {{1, -1, 0}, {0, 0, 0, 1}},
+    // Top
+    {{1, 1, 0}, {1, 0, 0, 1}},
+    {{1, 1, -2}, {0, 1, 0, 1}},
+    {{-1, 1, -2}, {0, 0, 1, 1}},
+    {{-1, 1, 0}, {0, 0, 0, 1}},
+    // Bottom
+    {{1, -1, -2}, {1, 0, 0, 1}},
+    {{1, -1, 0}, {0, 1, 0, 1}},
+    {{-1, -1, 0}, {0, 0, 1, 1}},
+    {{-1, -1, -2}, {0, 0, 0, 1}}};
+
+const GLubyte kIndices[] = {
+    // Front
+    0, 1, 2, 2, 3, 0,
+    // Back
+    4, 5, 6, 6, 7, 4,
+    // Left
+    8, 9, 10, 10, 11, 8,
+    // Right
+    12, 13, 14, 14, 15, 12,
+    // Top
+    16, 17, 18, 18, 19, 16,
+    // Bottom
+    20, 21, 22, 22, 23, 20};
+}
 
 //! [1]
 class CustomTextureNode : public QSGTextureProvider, public QSGSimpleTextureNode
@@ -72,15 +142,22 @@ public:
 //! [1]
 private slots:
     void render();
+    void renderEnd();
 
 private:
     enum Stage {
         VertexStage,
         FragmentStage
     };
-    void prepareShader(Stage stage);
-    using FuncAndLib = QPair<id<MTLFunction>, id<MTLLibrary> >;
-    FuncAndLib compileShaderFromSource(const QByteArray &src, const QByteArray &entryPoint);
+    void cleanupGLTexture();
+    void prepareGLFunctionPointers();
+    void prepareGLTexture();
+    void prepareSemaphore();
+    void prepareShaders();
+    GLuint prepareShader(GLenum stage);
+    GLuint compileShaderFromSource(GLenum stage, const QByteArray &src);
+
+    void doGLRender();
 
     QQuickItem *m_item;
     QQuickWindow *m_window;
@@ -88,19 +165,36 @@ private:
     qreal m_dpr;
     id<MTLDevice> m_device = nil;
     id<MTLTexture> m_texture = nil;
+    id<MTLSharedEvent> m_semaphore = nil;
+
+    uint64_t m_semaphoreCounter = 0;
 
     bool m_initialized = false;
-    QByteArray m_vert;
-    QByteArray m_vertEntryPoint;
-    QByteArray m_frag;
-    QByteArray m_fragEntryPoint;
-    FuncAndLib m_vs;
-    FuncAndLib m_fs;
-    id<MTLBuffer> m_vbuf;
-    id<MTLBuffer> m_ubuf[3];
-    id<MTLRenderPipelineState> m_pipeline;
+
+    MGLContext *m_contextMGL = nil;
+    GLuint m_fboGL = 0;
+    GLuint m_textureGL = 0;
+    GLuint m_depthBufferGL = 0;
+    EGLImageKHR m_imageEGL = 0;
+    GLuint m_semaphoreGL = 0;
+
+    GLuint m_shaderProgramGL = 0;
+    GLint m_positionSlot = -1;
+    GLint m_colorSlot = -1;
+    GLint m_projectionUniform = -1;
+    GLint m_modelViewUniform = -1;
 
     float m_t;
+
+    PFNGLEGLIMAGETARGETTEXTURE2DOESPROC glEGLImageTargetTexture2DOES = nullptr;
+
+    PFNGLIMPORTSEMAPHOREFDEXTPROC glImportSemaphoreFdEXT = nullptr;
+
+    PFNGLGENSEMAPHORESEXTPROC glGenSemaphoresEXT       = nullptr;
+    PFNGLDELETESEMAPHORESEXTPROC glDeleteSemaphoresEXT = nullptr;
+    PFNGLSEMAPHOREPARAMETERUI64VEXTPROC glSemaphoreParameterui64vEXT = nullptr;
+    PFNGLWAITSEMAPHOREEXTPROC glWaitSemaphoreEXT       = nullptr;
+    PFNGLSIGNALSEMAPHOREEXTPROC glSignalSemaphoreEXT   = nullptr;
 };
 
 CustomTextureItem::CustomTextureItem()
@@ -172,44 +266,35 @@ CustomTextureNode::CustomTextureNode(QQuickItem *item)
 {
     m_window = m_item->window();
     connect(m_window, &QQuickWindow::beforeRendering, this, &CustomTextureNode::render);
+    connect(m_window, &QQuickWindow::afterRendering, this, &CustomTextureNode::renderEnd);
     connect(m_window, &QQuickWindow::screenChanged, this, [this]() {
         if (m_window->effectiveDevicePixelRatio() != m_dpr)
             m_item->update();
     });
 //! [3]
-    m_vs.first = nil;
-    m_vs.second = nil;
-
-    m_fs.first = nil;
-    m_fs.second = nil;
-
-    m_vbuf = nil;
-
-    for (int i = 0; i < 3; ++i)
-        m_ubuf[i] = nil;
-
-    m_pipeline = nil;
 
     qDebug("renderer created");
 }
 
 CustomTextureNode::~CustomTextureNode()
 {
-    [m_pipeline release];
+    cleanupGLTexture();
 
-    [m_vbuf release];
+    if (m_semaphoreGL) {
+        glDeleteSemaphoresEXT(1, &m_semaphoreGL);
+        m_semaphoreGL = 0;
+    }
 
-    for (int i = 0; i < 3; ++i)
-        [m_ubuf[i] release];
+    if (m_shaderProgramGL) {
+        glDeleteProgram(m_shaderProgramGL);
+        m_shaderProgramGL = 0;
+    }
 
-    [m_vs.first release];
-    [m_vs.second release];
-
-    [m_fs.first release];
-    [m_fs.second release];
+    [m_contextMGL release];
 
     delete texture();
     [m_texture release];
+    [m_semaphore release];
 
     qDebug("renderer destroyed");
 }
@@ -219,14 +304,26 @@ QSGTexture *CustomTextureNode::texture() const
     return QSGSimpleTextureNode::texture();
 }
 
-static const float vertices[] = {
-    -1, -1,
-    1, -1,
-    -1, 1,
-    1, 1
-};
+void CustomTextureNode::cleanupGLTexture()
+{
+    if (m_fboGL) {
+        glDeleteFramebuffers(1, &m_fboGL);
+        m_fboGL = 0;
+    }
+    if (m_textureGL) {
+        glDeleteTextures(1, &m_textureGL);
+        m_textureGL = 0;
+    }
+    if (m_imageEGL) {
+        eglDestroyImageKHR(m_contextMGL.eglDisplay, m_imageEGL);
+        m_imageEGL = 0;
+    }
 
-const int UBUF_SIZE = 4;
+    if (m_depthBufferGL) {
+        glDeleteRenderbuffers(1, &m_depthBufferGL);
+        m_depthBufferGL = 0;
+    }
+}
 
 //! [4]
 void CustomTextureNode::sync()
@@ -243,6 +340,12 @@ void CustomTextureNode::sync()
         m_size = newSize;
     }
 
+    if (!m_contextMGL) {
+        m_contextMGL = [[MGLContext alloc] initWithAPI:kMGLRenderingAPIOpenGLES2];
+        [MGLContext setCurrentContext:m_contextMGL];
+        prepareGLFunctionPointers();
+    }
+
     if (needsNew) {
         delete texture();
         [m_texture release];
@@ -251,6 +354,7 @@ void CustomTextureNode::sync()
         m_device = (id<MTLDevice>) rif->getResource(m_window, QSGRendererInterface::DeviceResource);
         Q_ASSERT(m_device);
 
+        // Create Metal texture
         MTLTextureDescriptor *desc = [[MTLTextureDescriptor alloc] init];
         desc.textureType = MTLTextureType2D;
         desc.pixelFormat = MTLPixelFormatRGBA8Unorm;
@@ -263,6 +367,10 @@ void CustomTextureNode::sync()
         m_texture = [m_device newTextureWithDescriptor: desc];
         [desc release];
 
+        // Bind Metal texture to OpenGL's texture object
+        prepareGLTexture();
+
+        // Qt texture wrapper
         QSGTexture *wrapper = QNativeInterface::QSGMetalTexture::fromNative(m_texture, m_window, m_size);
 
         qDebug() << "Got QSGTexture wrapper" << wrapper << "for an MTLTexture of size" << m_size;
@@ -273,47 +381,8 @@ void CustomTextureNode::sync()
     if (!m_initialized && texture()) {
         m_initialized = true;
 
-        prepareShader(VertexStage);
-        prepareShader(FragmentStage);
-
-        m_vs = compileShaderFromSource(m_vert, m_vertEntryPoint);
-        m_fs = compileShaderFromSource(m_frag, m_fragEntryPoint);
-
-        const int framesInFlight = m_window->graphicsStateInfo().framesInFlight;
-
-        m_vbuf = [m_device newBufferWithLength: sizeof(vertices) options: MTLResourceStorageModeShared];
-        void *p = [m_vbuf contents];
-        memcpy(p, vertices, sizeof(vertices));
-
-        for (int i = 0; i < framesInFlight; ++i)
-            m_ubuf[i] = [m_device newBufferWithLength: UBUF_SIZE options: MTLResourceStorageModeShared];
-
-        MTLVertexDescriptor *inputLayout = [MTLVertexDescriptor vertexDescriptor];
-        inputLayout.attributes[0].format = MTLVertexFormatFloat2;
-        inputLayout.attributes[0].offset = 0;
-        inputLayout.attributes[0].bufferIndex = 1; // ubuf is 0, vbuf is 1
-        inputLayout.layouts[1].stride = 2 * sizeof(float);
-
-        MTLRenderPipelineDescriptor *rpDesc = [[MTLRenderPipelineDescriptor alloc] init];
-        rpDesc.vertexDescriptor = inputLayout;
-
-        rpDesc.vertexFunction = m_vs.first;
-        rpDesc.fragmentFunction = m_fs.first;
-
-        rpDesc.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm;
-        rpDesc.colorAttachments[0].blendingEnabled = true;
-        rpDesc.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorSourceAlpha;
-        rpDesc.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorSourceAlpha;
-        rpDesc.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOne;
-        rpDesc.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorOne;
-
-        NSError *err = nil;
-        m_pipeline = [m_device newRenderPipelineStateWithDescriptor: rpDesc error: &err];
-        if (!m_pipeline) {
-            const QString msg = QString::fromNSString(err.localizedDescription);
-            qFatal("Failed to create render pipeline state: %s", qPrintable(msg));
-        }
-        [rpDesc release];
+        prepareSemaphore();
+        prepareShaders();
 
         qDebug("resources initialized");
     }
@@ -333,48 +402,214 @@ void CustomTextureNode::render()
     if (!m_initialized)
         return;
 
-    // Render to m_texture.
-    MTLRenderPassDescriptor *renderpassdesc = [MTLRenderPassDescriptor renderPassDescriptor];
-    MTLClearColor c = MTLClearColorMake(0, 0, 0, 1);
-    renderpassdesc.colorAttachments[0].loadAction = MTLLoadActionClear;
-    renderpassdesc.colorAttachments[0].storeAction = MTLStoreActionStore;
-    renderpassdesc.colorAttachments[0].clearColor = c;
-    renderpassdesc.colorAttachments[0].texture = m_texture;
+    // Render to m_texture using OpenGL
+    [MGLContext setCurrentContext:m_contextMGL];
+
+    // Wait for Metal side to finish using the texture (this waiting will happen on GPU side, not here,
+    // it won't block here). We have to use semaphore because MetalANGLE and Qt use different
+    // Metal command queue.
+    glSemaphoreParameterui64vEXT(m_semaphoreGL, GL_TIMELINE_SEMAPHORE_VALUE_MGL, &m_semaphoreCounter);
+    const GLenum imageLayout = GL_LAYOUT_COLOR_ATTACHMENT_EXT;
+    glWaitSemaphoreEXT(m_semaphoreGL, 0, nullptr, 1, &m_textureGL, &imageLayout);
+
+    // Do OpenGL draws
+    doGLRender();
+
+    // Notify Metal side that the rendering has happened
+    m_semaphoreCounter++;
+    glSemaphoreParameterui64vEXT(m_semaphoreGL, GL_TIMELINE_SEMAPHORE_VALUE_MGL, &m_semaphoreCounter);
+    glSignalSemaphoreEXT(m_semaphoreGL, 0, nullptr, 1, &m_textureGL, &imageLayout);
 
     QSGRendererInterface *rif = m_window->rendererInterface();
     id<MTLCommandBuffer> cb = (id<MTLCommandBuffer>) rif->getResource(m_window, QSGRendererInterface::CommandListResource);
     Q_ASSERT(cb);
-    id<MTLRenderCommandEncoder> encoder = [cb renderCommandEncoderWithDescriptor: renderpassdesc];
-
-    const QQuickWindow::GraphicsStateInfo &stateInfo(m_window->graphicsStateInfo());
-    void *p = [m_ubuf[stateInfo.currentFrameSlot] contents];
-    memcpy(p, &m_t, 4);
-
-    MTLViewport vp;
-    vp.originX = 0;
-    vp.originY = 0;
-    vp.width = m_size.width();
-    vp.height = m_size.height();
-    vp.znear = 0;
-    vp.zfar = 1;
-    [encoder setViewport: vp];
-
-    [encoder setFragmentBuffer: m_ubuf[stateInfo.currentFrameSlot] offset: 0 atIndex: 0];
-    [encoder setVertexBuffer: m_vbuf offset: 0 atIndex: 1];
-    [encoder setRenderPipelineState: m_pipeline];
-    [encoder drawPrimitives: MTLPrimitiveTypeTriangleStrip vertexStart: 0 vertexCount: 4 instanceCount: 1 baseInstance: 0];
-
-    [encoder endEncoding];
+    [cb encodeWaitForEvent:m_semaphore value:m_semaphoreCounter];
 }
 //! [6]
 
-void CustomTextureNode::prepareShader(Stage stage)
+void CustomTextureNode::doGLRender()
+{
+    glBindFramebuffer(GL_FRAMEBUFFER, m_fboGL);
+
+    // Setup uniforms
+    glUseProgram(m_shaderProgramGL);
+
+    CC3GLMatrix *projection = [CC3GLMatrix matrix];
+    float h                 = 4.0f * m_texture.height / m_texture.width;
+    [projection populateFromFrustumLeft:-2
+                               andRight:2
+                              andBottom:-h / 2
+                                 andTop:h / 2
+                                andNear:4
+                                 andFar:10];
+    glUniformMatrix4fv(m_projectionUniform, 1, 0, projection.glMatrix);
+
+    CC3GLMatrix *modelView = [CC3GLMatrix matrix];
+    [modelView populateFromTranslation:CC3VectorMake(sin(std::fmod(CACurrentMediaTime(), 2 * M_PI)), 0, -7)];
+    float currentRotation = std::fmod(CACurrentMediaTime() * 90, 360);
+    [modelView rotateBy:CC3VectorMake(currentRotation, currentRotation, 0)];
+    glUniformMatrix4fv(m_modelViewUniform, 1, 0, modelView.glMatrix);
+
+    glViewport(0, 0, m_texture.width, m_texture.height);
+
+    glClearColor(0, 104.0 / 255.0, 55.0 / 255.0, 1.0);
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+    glEnable(GL_DEPTH_TEST);
+
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
+    glEnableVertexAttribArray(m_positionSlot);
+    glEnableVertexAttribArray(m_colorSlot);
+    glVertexAttribPointer(m_positionSlot, 3, GL_FLOAT, GL_FALSE, sizeof(Vertex), kVertices);
+    glVertexAttribPointer(m_colorSlot, 4, GL_FLOAT, GL_FALSE, sizeof(Vertex), &kVertices[0].Color);
+
+    glDrawElements(GL_TRIANGLES, sizeof(kIndices) / sizeof(kIndices[0]), GL_UNSIGNED_BYTE, kIndices);
+}
+
+void CustomTextureNode::renderEnd()
+{
+    // Notify OpenGL side that Metal has issued the rendering commands using the shared texture
+    QSGRendererInterface *rif = m_window->rendererInterface();
+    id<MTLCommandBuffer> cb = (id<MTLCommandBuffer>) rif->getResource(m_window, QSGRendererInterface::CommandListResource);
+    Q_ASSERT(cb);
+
+    m_semaphoreCounter++;
+    [cb encodeSignalEvent:m_semaphore value:m_semaphoreCounter];
+}
+
+void CustomTextureNode::prepareGLFunctionPointers()
+{
+    // Use function pointers to avoid conflict with Apple's GL header
+#define GET_GL_PROC(name) name = reinterpret_cast<__typeof__(name)>(eglGetProcAddress(#name))
+
+    GET_GL_PROC(glEGLImageTargetTexture2DOES);
+
+    GET_GL_PROC(glImportSemaphoreFdEXT);
+
+    GET_GL_PROC(glGenSemaphoresEXT);
+    GET_GL_PROC(glDeleteSemaphoresEXT);
+    GET_GL_PROC(glWaitSemaphoreEXT);
+    GET_GL_PROC(glSignalSemaphoreEXT);
+    GET_GL_PROC(glSemaphoreParameterui64vEXT);
+}
+
+void CustomTextureNode::prepareGLTexture()
+{
+    // Required extensions (if using MetalANGLE and the running macOS version is 10.14+, these extensions are guaranteed to exist)
+    const auto eglExtensions = reinterpret_cast<const char *>(eglQueryString(m_contextMGL.eglDisplay, EGL_EXTENSIONS));
+    Q_ASSERT(strstr(eglExtensions, "EGL_MGL_mtl_texture_client_buffer"));
+
+    // Check that MetalANGLE uses the same Metal device as Qt
+    EGLAttrib angleDevice = 0;
+    EGLAttrib device      = 0;
+    eglQueryDisplayAttribEXT(m_contextMGL.eglDisplay, EGL_DEVICE_EXT, &angleDevice);
+
+    eglQueryDeviceAttribEXT(reinterpret_cast<EGLDeviceEXT>(angleDevice),
+                                            EGL_MTL_DEVICE_ANGLE, &device);
+
+    Q_ASSERT((__bridge id<MTLDevice>)reinterpret_cast<void *>(device) == m_device);
+
+    cleanupGLTexture();
+
+    // Bind metal texture to OpenGL's texture object
+    constexpr EGLint kDefaultEGLImageAttribs[] = {
+        EGL_NONE,
+    };
+    m_imageEGL =
+        eglCreateImageKHR(m_contextMGL.eglDisplay, EGL_NO_CONTEXT, EGL_MTL_TEXTURE_MGL,
+                          reinterpret_cast<EGLClientBuffer>(m_texture), kDefaultEGLImageAttribs);
+
+    // Create a texture target to bind the egl image
+    glGenTextures(1, &m_textureGL);
+    glBindTexture(GL_TEXTURE_2D, m_textureGL);
+    glEGLImageTargetTexture2DOES(GL_TEXTURE_2D, m_imageEGL);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+
+    // Create depth buffer
+    glGenRenderbuffers(1, &m_depthBufferGL);
+    glBindRenderbuffer(GL_RENDERBUFFER, m_depthBufferGL);
+    glRenderbufferStorage(GL_RENDERBUFFER,
+                          GL_DEPTH_COMPONENT16,
+                          (GLsizei)m_texture.width,
+                          (GLsizei)m_texture.height);
+
+    // Create framebuffer object
+    glGenFramebuffers(1, &m_fboGL);
+    glBindFramebuffer(GL_FRAMEBUFFER, m_fboGL);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, m_textureGL, 0);
+    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, m_depthBufferGL);
+    Q_ASSERT(glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE);
+}
+
+void CustomTextureNode::prepareSemaphore()
+{
+    // First, create Metal shared event
+    m_semaphore = [m_device newSharedEvent];
+    m_semaphore.signaledValue = m_semaphoreCounter;
+
+    // Required extensions (if using MetalANGLE and the running macOS version is 10.14+, these extensions are guaranteed to exist)
+    const auto glExtensions = reinterpret_cast<const char *>(glGetString(GL_EXTENSIONS));
+    Q_ASSERT(strstr(glExtensions, "GL_EXT_semaphore"));
+    Q_ASSERT(strstr(glExtensions, "GL_EXT_semaphore_fd"));
+    Q_ASSERT(strstr(glExtensions, "GL_MGL_timeline_semaphore"));
+
+    // Write to file and pass its fd to OpenGL.
+    // NOTE: fd will be owned by OpenGL, so don't close it.
+    char name[] = "/tmp/XXXXXX";
+    int tmpFd;
+    tmpFd = mkstemp(name);
+    unlink(name);
+
+    void *sharedEventPtr = (__bridge void *)m_semaphore;
+    pwrite(tmpFd, &sharedEventPtr, sizeof(sharedEventPtr), 0);
+
+    // Import shared event to OpenGL as semaphore object
+    glGenSemaphoresEXT(1, &m_semaphoreGL);
+    glImportSemaphoreFdEXT(m_semaphoreGL, GL_HANDLE_TYPE_OPAQUE_FD_EXT, tmpFd);
+}
+
+void CustomTextureNode::prepareShaders()
+{
+    GLuint vertexShader = prepareShader(GL_VERTEX_SHADER);
+    GLuint fragmentShader = prepareShader(GL_FRAGMENT_SHADER);
+
+    GLuint programHandle = glCreateProgram();
+    glAttachShader(programHandle, vertexShader);
+    glAttachShader(programHandle, fragmentShader);
+
+    glDeleteShader(vertexShader);
+    glDeleteShader(fragmentShader);
+
+    glLinkProgram(programHandle);
+
+    GLint linkSuccess;
+    glGetProgramiv(programHandle, GL_LINK_STATUS, &linkSuccess);
+    if (linkSuccess == GL_FALSE)
+    {
+        GLchar messages[256];
+        glGetProgramInfoLog(programHandle, sizeof(messages), 0, &messages[0]);
+        NSString *messageString = [NSString stringWithUTF8String:messages];
+        NSLog(@"%@", messageString);
+        exit(1);
+    }
+
+    glUseProgram(programHandle);
+    m_shaderProgramGL = programHandle;
+
+    m_positionSlot = glGetAttribLocation(programHandle, "Position");
+    m_colorSlot    = glGetAttribLocation(programHandle, "SourceColor");
+
+    m_projectionUniform = glGetUniformLocation(programHandle, "Projection");
+    m_modelViewUniform  = glGetUniformLocation(programHandle, "Modelview");
+}
+
+GLuint CustomTextureNode::prepareShader(GLenum stage)
 {
     QString filename;
-    if (stage == VertexStage) {
+    if (stage == GL_VERTEX_SHADER) {
         filename = QLatin1String(":/scenegraph/metaltextureimport/squircle.vert");
     } else {
-        Q_ASSERT(stage == FragmentStage);
+        Q_ASSERT(stage == GL_FRAGMENT_SHADER);
         filename = QLatin1String(":/scenegraph/metaltextureimport/squircle.frag");
     }
     QFile f(filename);
@@ -383,40 +618,31 @@ void CustomTextureNode::prepareShader(Stage stage)
 
     const QByteArray contents = f.readAll();
 
-    if (stage == VertexStage) {
-        m_vert = contents;
-        Q_ASSERT(!m_vert.isEmpty());
-        m_vertEntryPoint = QByteArrayLiteral("main0");
-    } else {
-        m_frag = contents;
-        Q_ASSERT(!m_frag.isEmpty());
-        m_fragEntryPoint = QByteArrayLiteral("main0");
-    }
+    return compileShaderFromSource(stage, contents);
 }
 
-CustomTextureNode::FuncAndLib CustomTextureNode::compileShaderFromSource(const QByteArray &src, const QByteArray &entryPoint)
+GLuint CustomTextureNode::compileShaderFromSource(GLenum stage, const QByteArray &src)
 {
-    FuncAndLib fl;
+    GLuint shaderHandle = glCreateShader(stage);
 
-    NSString *srcstr = [NSString stringWithUTF8String: src.constData()];
-    MTLCompileOptions *opts = [[MTLCompileOptions alloc] init];
-    opts.languageVersion = MTLLanguageVersion1_2;
-    NSError *err = nil;
-    fl.second = [m_device newLibraryWithSource: srcstr options: opts error: &err];
-    [opts release];
-    // srcstr is autoreleased
+    const char *shaderStringUTF8 = src.constData();
+    int shaderStringLength       = (int)src.length();
+    glShaderSource(shaderHandle, 1, &shaderStringUTF8, &shaderStringLength);
 
-    if (err) {
-        const QString msg = QString::fromNSString(err.localizedDescription);
-        qFatal("%s", qPrintable(msg));
-        return fl;
+    glCompileShader(shaderHandle);
+
+    GLint compileSuccess;
+    glGetShaderiv(shaderHandle, GL_COMPILE_STATUS, &compileSuccess);
+    if (compileSuccess == GL_FALSE)
+    {
+        GLchar messages[256];
+        glGetShaderInfoLog(shaderHandle, sizeof(messages), 0, &messages[0]);
+        NSString *messageString = [NSString stringWithUTF8String:messages];
+        NSLog(@"%@", messageString);
+        exit(1);
     }
 
-    NSString *name = [NSString stringWithUTF8String: entryPoint.constData()];
-    fl.first = [fl.second newFunctionWithName: name];
-    [name release];
-
-    return fl;
+    return shaderHandle;
 }
 
 #include "metaltextureimport.moc"
