@@ -7,5 +7,7 @@ Example of mixing MetalANGLE with Qt's QML.
 - To ensure correct order of rendering (on MetalANGLE side) and consuming (on Qt's Metal side),
 a shared semaphore also needs to be used. See [GL_EXT_semaphore](https://www.khronos.org/registry/OpenGL/extensions/EXT/EXT_external_objects.txt).
 
+<img src="https://i.imgur.com/YEy7HvA.png" alt="drawing" width="400"/>
+
 ## In-depth explanation
 - TODO
